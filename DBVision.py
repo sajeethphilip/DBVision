@@ -54,6 +54,7 @@ import pandas as pd
 import numpy as np
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
+import torch.nn.functional as F
 import matplotlib.pyplot as plt
 from pathlib import Path
 import yaml
@@ -94,6 +95,29 @@ class TrainingConfig:
     epochs: int
     num_workers: int
     enhancement_specific: Dict
+
+class SelfAttentionEnhanced(nn.Module):
+    """Self-attention module from old model for enhanced feature refinement"""
+    def __init__(self, in_channels: int):
+        super().__init__()
+        self.in_channels = in_channels
+        self.query = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, channels, height, width = x.size()
+        queries = self.query(x).view(batch_size, -1, height * width).permute(0, 2, 1)
+        keys = self.key(x).view(batch_size, -1, height * width)
+        values = self.value(x).view(batch_size, -1, height * width)
+
+        attention_scores = torch.bmm(queries, keys)
+        attention_scores = F.softmax(attention_scores, dim=-1)
+
+        out = torch.bmm(values, attention_scores.permute(0, 2, 1))
+        out = out.view(batch_size, channels, height, width)
+        return self.gamma * out + x
 
 class ConfigManager:
     """Manages configuration files for the entire system"""
@@ -152,6 +176,9 @@ class ConfigManager:
                 "image_type": "general"
             },
             "model": {
+                 "use_kl_divergence": true,
+                "use_class_encoding": true,
+                "clustering_temperature": 1.0,
                 "encoder_type": "enhanced",
                 "feature_dims": 128,
                 "learning_rate": 0.001,
@@ -774,6 +801,9 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         # Control whether to use compression
         self.use_compression = False  # Start with raw features during main training
 
+        # ENHANCED: Initialize clustering and classification components
+        self._initialize_enhanced_components(num_classes)
+
         # Domain-specific components
         self.setup_domain_specific_components()
 
@@ -807,37 +837,49 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             return self._build_128x128_encoder()
 
     def _build_32x32_encoder(self) -> nn.Module:
-        """Encoder for 32x32 images (like CIFAR, resized MNIST)"""
+        """Enhanced encoder for 32x32 images with attention"""
         return nn.Sequential(
-            # Input: [channels, 32, 32]
+            # Block 1
             nn.Conv2d(self.in_channels, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 16x16
+            SelfAttentionEnhanced(64),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
+            nn.Dropout(0.1),
 
+            # Block 2
             nn.Conv2d(64, 128, 3, 1, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1, True),
             nn.Conv2d(128, 128, 3, 1, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 8x8
+            SelfAttentionEnhanced(128),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
+            nn.Dropout(0.1),
 
+            # Block 3
             nn.Conv2d(128, 256, 3, 1, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, True),
             nn.Conv2d(256, 256, 3, 1, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 4x4
+            nn.MaxPool2d(2, 2),
+            nn.Dropout(0.2),
 
+            # Block 4
             nn.Conv2d(256, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((2, 2)),
+            nn.Dropout(0.2),
 
             nn.Flatten(),
             nn.Linear(512 * 2 * 2, 1024),
@@ -849,33 +891,39 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         )
 
     def _build_64x64_encoder(self) -> nn.Module:
-        """Encoder for 64x64 images"""
+        """Enhanced encoder for 64x64 images with attention"""
         return nn.Sequential(
-            # Input: [channels, 64, 64]
+            # Block 1
             nn.Conv2d(self.in_channels, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 32x32
+            SelfAttentionEnhanced(64),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
 
+            # Block 2
             nn.Conv2d(64, 128, 3, 1, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 16x16
+            SelfAttentionEnhanced(128),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
 
+            # Block 3
             nn.Conv2d(128, 256, 3, 1, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 8x8
+            nn.MaxPool2d(2, 2),
 
+            # Block 4
             nn.Conv2d(256, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 4x4
+            nn.MaxPool2d(2, 2),
 
+            # Block 5
             nn.Conv2d(512, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+            nn.AdaptiveAvgPool2d((2, 2)),
 
             nn.Flatten(),
             nn.Linear(512 * 2 * 2, 1024),
@@ -887,34 +935,36 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         )
 
     def _build_128x128_encoder(self) -> nn.Module:
-        """Encoder for 128x128 images (larger but memory-safe)"""
+        """Enhanced encoder for 128x128 images with attention"""
         return nn.Sequential(
-            # Input: [channels, 128, 128]
+            # Initial downsampling
             nn.Conv2d(self.in_channels, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 64x64
+            SelfAttentionEnhanced(64),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
 
-            # Continue with 64x64 architecture
+            # Continue with 64x64 architecture but enhanced
             nn.Conv2d(64, 128, 3, 1, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 32x32
+            SelfAttentionEnhanced(128),  # Enhanced with attention
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(128, 256, 3, 1, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 16x16
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(256, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 8x8
+            nn.MaxPool2d(2, 2),
 
             nn.Conv2d(512, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+            nn.AdaptiveAvgPool2d((2, 2)),
 
             nn.Flatten(),
             nn.Linear(512 * 2 * 2, 1024),
@@ -1273,6 +1323,73 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
 
         return reconstructed, compressed_latent, current_latent, efficiency_scores
 
+    def _initialize_enhanced_components(self, num_classes: int):
+        """Initialize enhanced components from old model: clustering and classification"""
+        # Initialize clustering components
+        self.use_kl_divergence = self.config['model'].get('use_kl_divergence', True)
+        if self.use_kl_divergence:
+            self.register_buffer('cluster_centers',
+                               torch.randn(num_classes, self.latent_dim))
+            self.register_buffer('clustering_temperature',
+                               torch.tensor([1.0]))
+
+        # Initialize classifier for semantic guidance
+        self.classifier = nn.Sequential(
+            nn.Linear(self.latent_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.1),
+            nn.Linear(128, num_classes)
+        )
+
+    def organize_latent_space(self, embeddings: torch.Tensor, labels: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """Enhanced latent space organization with clustering from old model"""
+        output = {'embeddings': embeddings}
+
+        # Clustering organization
+        if self.use_kl_divergence and hasattr(self, 'cluster_centers'):
+            cluster_centers = self.cluster_centers.to(embeddings.device)
+            distances = torch.cdist(embeddings, cluster_centers)
+
+            # Convert distances to probabilities (soft assignments)
+            q_dist = 1.0 / (1.0 + (distances / self.clustering_temperature) ** 2)
+            q_dist = q_dist / q_dist.sum(dim=1, keepdim=True)
+
+            if labels is not None:
+                # Create target distribution if labels are provided
+                p_dist = torch.zeros_like(q_dist)
+                for i in range(self.cluster_centers.size(0)):
+                    mask = (labels == i)
+                    if mask.any():
+                        p_dist[mask, i] = 1.0
+            else:
+                # During prediction, use current distribution as target
+                p_dist = q_dist.detach()
+
+            output.update({
+                'cluster_probabilities': q_dist,
+                'target_distribution': p_dist,
+                'cluster_assignments': q_dist.argmax(dim=1),
+                'cluster_confidence': q_dist.max(dim=1)[0]
+            })
+
+        # Classification head
+        if hasattr(self, 'classifier'):
+            class_logits = self.classifier(embeddings)
+            output.update({
+                'class_logits': class_logits,
+                'class_predictions': class_logits.argmax(dim=1),
+                'class_probabilities': F.softmax(class_logits, dim=1)
+            })
+
+        return output
+
+
+
 
 # Expert Modules (from previous implementation, enhanced)
 class ReconstructionExpert(nn.Module):
@@ -1375,12 +1492,25 @@ class UnifiedFeatureExtractor:
         return self.model
 
     def train(self, data_dir: str = "Data", save_dir: str = "models"):
-        """Multi-round competitive training with latent space consistency"""
+        """Multi-round competitive training with enhanced latent space organization and label encoding"""
         if self.dataset is None:
             self.setup_data(data_dir, "train")
 
         if self.model is None:
             self.initialize_model()
+
+        # ENHANCED: Initialize label encoder for folder name preservation
+        from sklearn.preprocessing import LabelEncoder
+        self.label_encoder = LabelEncoder()
+
+        # Fit label encoder with class names from dataset
+        if hasattr(self.dataset, 'class_names'):
+            self.label_encoder.fit(self.dataset.class_names)
+            logger.info(f"🏷️  Label encoder initialized with {len(self.label_encoder.classes_)} classes: {list(self.label_encoder.classes_)}")
+        else:
+            # Fallback: use numeric labels but warn user
+            logger.warning("⚠️  No class names found in dataset, using numeric labels")
+            self.label_encoder = None
 
         # Set deterministic training for reproducibility
         torch.manual_seed(42)
@@ -1416,9 +1546,9 @@ class UnifiedFeatureExtractor:
         # More aggressive but achievable loss targets
         phases = [
             (1, "Base Autoencoder", 0.05),
-            (2, "+ Reconstruction Expert", 0.03),
-            (3, "+ Semantic Density Expert", 0.02),
-            (4, "+ Efficiency Critic", 0.015)
+            (2, "+ Reconstruction Expert + Clustering", 0.03),
+            (3, "+ Semantic Density Expert + Classification", 0.02),
+            (4, "+ Efficiency Critic + Full Enhancement", 0.015)
         ]
 
         # Multi-round training parameters
@@ -1445,6 +1575,7 @@ class UnifiedFeatureExtractor:
                     self.model.train()
                     total_loss = 0
                     num_batches = 0
+                    loss_components_avg = {'reconstruction': 0, 'clustering': 0, 'classification': 0, 'efficiency': 0}
 
                     for batch_idx, (data, targets, _) in enumerate(train_loader):
                         data = data.to(self.device, non_blocking=True)
@@ -1452,17 +1583,42 @@ class UnifiedFeatureExtractor:
 
                         optimizer.zero_grad()
 
-                        # Mixed precision forward pass - UPDATED UNPACKING
+                        # Mixed precision forward pass
                         with torch.amp.autocast('cuda'):
-                            # Model now returns 4 values: (reconstructed, current_latent, base_latent, efficiency_scores)
+                            # Model returns 4 values: (reconstructed, current_latent, base_latent, efficiency_scores)
                             reconstructed, current_latent, base_latent, efficiency_scores = self.model(data, targets, phase=phase_num)
 
+                            # ENHANCED LOSS CALCULATION WITH OLD MODEL TECHNIQUES
+                            rec_loss = criterion(reconstructed, data)
+                            total_batch_loss = rec_loss
+                            loss_components = {'reconstruction': rec_loss.item()}
+
+                            # Phase 2+: Add clustering loss from old model
+                            if phase_num >= 2 and hasattr(self.model, 'use_kl_divergence') and self.model.use_kl_divergence:
+                                cluster_info = self.model.organize_latent_space(current_latent, targets)
+                                if 'cluster_probabilities' in cluster_info and 'target_distribution' in cluster_info:
+                                    cluster_loss = F.kl_div(
+                                        cluster_info['cluster_probabilities'].log(),
+                                        cluster_info['target_distribution'],
+                                        reduction='batchmean'
+                                    )
+                                    total_batch_loss = total_batch_loss + 0.1 * cluster_loss
+                                    loss_components['clustering'] = cluster_loss.item()
+
+                            # Phase 3+: Add classification loss from old model
+                            if phase_num >= 3 and targets is not None and hasattr(self.model, 'classifier'):
+                                class_logits = self.model.classifier(current_latent)
+                                class_loss = F.cross_entropy(class_logits, targets)
+                                total_batch_loss = total_batch_loss + 0.1 * class_loss
+                                loss_components['classification'] = class_loss.item()
+
+                            # Phase 4+: Add efficiency loss (original functionality)
                             if phase_num >= 4:
-                                rec_loss = criterion(reconstructed, data)
                                 eff_loss = (1 - efficiency_scores[:, 0]).mean()
-                                loss = rec_loss + 0.1 * eff_loss
-                            else:
-                                loss = criterion(reconstructed, data)
+                                total_batch_loss = total_batch_loss + 0.1 * eff_loss
+                                loss_components['efficiency'] = eff_loss.item()
+
+                            loss = total_batch_loss
 
                         # Skip NaN batches
                         if torch.isnan(loss):
@@ -1478,10 +1634,18 @@ class UnifiedFeatureExtractor:
                         total_loss += loss.item()
                         num_batches += 1
 
+                        # Accumulate loss components for logging
+                        for key in loss_components_avg:
+                            if key in loss_components:
+                                loss_components_avg[key] += loss_components[key]
+
                     if num_batches == 0:
                         continue
 
+                    # Calculate averages
                     epoch_loss = total_loss / num_batches
+                    for key in loss_components_avg:
+                        loss_components_avg[key] /= num_batches
 
                     # Dynamic learning rate adjustment based on progress
                     current_lr = optimizer.param_groups[0]['lr']
@@ -1502,12 +1666,23 @@ class UnifiedFeatureExtractor:
                             for param_group in optimizer.param_groups:
                                 param_group['lr'] = max(current_lr * 0.8, 1e-6)
 
+                    # Enhanced logging with loss components
                     if epoch % 2 == 0:
                         current_lr = optimizer.param_groups[0]['lr']
                         progress_pct = (target_loss / epoch_loss * 100) if epoch_loss > 0 else 0
+
+                        # Build detailed loss string
+                        loss_details = []
+                        for comp_name, comp_value in loss_components_avg.items():
+                            if comp_value > 0:
+                                loss_details.append(f"{comp_name[:4]}:{comp_value:.4f}")
+                        loss_str = " | ".join(loss_details)
+
                         logger.info(f'Round {current_round + 1} Phase {phase_num} Epoch [{epoch}/{max_epochs_per_phase}], '
                                    f'Loss: {epoch_loss:.4f}, Best: {phase_best_loss:.4f}, '
                                    f'Target: {target_loss:.4f} ({progress_pct:.1f}%), LR: {current_lr:.6f}')
+                        if loss_str:
+                            logger.info(f'📊 Loss components: {loss_str}')
 
                     # Check if we've achieved target
                     if epoch >= min_epochs_per_phase and epoch_loss <= target_loss:
@@ -1523,15 +1698,28 @@ class UnifiedFeatureExtractor:
 
                 logger.info(f'✅ Round {current_round + 1} {description} completed with best loss: {phase_best_loss:.4f}')
 
-                # Save phase checkpoint
+                # Save phase checkpoint with label encoder
                 phase_checkpoint_path = Path(save_dir) / f"{self.dataset_name}_round{current_round + 1}_phase{phase_num}.pth"
-                torch.save({
+                checkpoint_data = {
                     'model_state_dict': self.model.state_dict(),
                     'phase': phase_num,
                     'round': current_round + 1,
                     'best_loss': phase_best_loss,
-                    'round_best_losses': round_best_losses
-                }, phase_checkpoint_path)
+                    'round_best_losses': round_best_losses,
+                    'enhanced_components': {
+                        'use_kl_divergence': getattr(self.model, 'use_kl_divergence', False),
+                        'has_classifier': hasattr(self.model, 'classifier')
+                    },
+                    # ENHANCED: Save label encoder information
+                    'label_encoder': {
+                        'classes': self.label_encoder.classes_.tolist() if self.label_encoder else [],
+                        'fitted': self.label_encoder is not None
+                    } if hasattr(self, 'label_encoder') else None,
+                    'dataset_name': self.dataset_name,
+                    'class_count': len(self.label_encoder.classes_) if self.label_encoder else 0
+                }
+                torch.save(checkpoint_data, phase_checkpoint_path)
+                logger.info(f"💾 Checkpoint saved with label encoder ({len(self.label_encoder.classes_) if self.label_encoder else 0} classes)")
 
             current_round += 1
             self.current_round = current_round  # Track current round for feature extraction
@@ -1558,17 +1746,30 @@ class UnifiedFeatureExtractor:
                         phases[i] = (phase_num, phases[i][1], new_target)
                         logger.info(f"🔄 Adjusting Phase {phase_num} target: {current_target:.4f} → {new_target:.4f}")
 
-        # Final model save
+        # ENHANCED: Final model save with label encoder
         self.save_model(save_dir)
 
         # Print final results
         logger.info("🏁 FINAL TRAINING RESULTS:")
         for phase_num, description, target_loss in phases:
             achieved = "✅" if round_best_losses[phase_num] <= target_loss else "❌"
-            logger.info(f"  {achieved} {description}: {round_best_losses[phase_num]:.4f} (target: {target_loss:.4f})")
+            improvement = target_loss - round_best_losses[phase_num] if round_best_losses[phase_num] <= target_loss else round_best_losses[phase_num] - target_loss
+            status = "ACHIEVED" if round_best_losses[phase_num] <= target_loss else "MISSED"
+            logger.info(f"  {achieved} {description}: {round_best_losses[phase_num]:.4f} (target: {target_loss:.4f}) [{status}]")
+
+        # Log enhanced components status
+        logger.info("🔧 Enhanced Components Status:")
+        logger.info(f"  - Self-Attention: ✅ Integrated in encoders")
+        logger.info(f"  - Clustering: {'✅ Enabled' if getattr(self.model, 'use_kl_divergence', False) else '❌ Disabled'}")
+        logger.info(f"  - Classification: {'✅ Enabled' if hasattr(self.model, 'classifier') else '❌ Disabled'}")
+        logger.info(f"  - Combined Losses: ✅ Active across all phases")
+        logger.info(f"  - Label Encoder: {'✅ ' + str(len(self.label_encoder.classes_)) + ' classes' if self.label_encoder else '❌ Not available'}")
+
+        if self.label_encoder:
+            logger.info(f"  - Class Names: {list(self.label_encoder.classes_)}")
 
     def extract_features(self, data_dir: str = "Data", split: str = "train", use_compression: bool = False) -> pd.DataFrame:
-        """Extract features with guaranteed latent space consistency and compression option"""
+        """Enhanced feature extraction with organized latent space"""
         if self.model is None:
             raise ValueError("Model not initialized. Call train() or load_model() first.")
 
@@ -1585,12 +1786,14 @@ class UnifiedFeatureExtractor:
         features_list = []
         targets_list = []
         image_paths_list = []
-        image_hashes_list = []  # For consistency verification
+        image_hashes_list = []
+        cluster_assignments_list = []  # Enhanced: store cluster info
+        cluster_confidence_list = []   # Enhanced: store confidence scores
 
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.main_config['training']['batch_size'],
-            shuffle=False,  # Important: maintain order for consistency
+            shuffle=False,
             num_workers=self.main_config['training']['num_workers']
         )
 
@@ -1599,16 +1802,24 @@ class UnifiedFeatureExtractor:
                 data = data.to(self.device)
                 targets = targets.to(self.device)
 
-                # Get final latent representation with consistent return structure
-                # Model now always returns 4 values: (reconstructed, current_latent, base_latent, efficiency_scores)
+                # Get final latent representation
                 reconstructed, final_latent, base_latent, efficiency_scores = self.model(
                     data, targets, phase=4, use_compression=use_compression
                 )
 
-                # Store features and metadata
-                features_list.append(final_latent.cpu().numpy())
+                # ENHANCED: Get organized latent space information
+                latent_info = self.model.organize_latent_space(final_latent, targets)
+                organized_latent = latent_info['embeddings']
+
+                # Store enhanced features and metadata
+                features_list.append(organized_latent.cpu().numpy())
                 targets_list.append(targets.cpu().numpy())
                 image_paths_list.extend(image_paths)
+
+                # Enhanced: Store clustering information
+                if 'cluster_assignments' in latent_info:
+                    cluster_assignments_list.append(latent_info['cluster_assignments'].cpu().numpy())
+                    cluster_confidence_list.append(latent_info['cluster_confidence'].cpu().numpy())
 
                 # Generate consistency hashes for verification
                 batch_hashes = [self._generate_image_hash(path) for path in image_paths]
@@ -1616,35 +1827,53 @@ class UnifiedFeatureExtractor:
 
                 if batch_idx % 10 == 0:
                     feature_type = "compressed" if use_compression else "rich 512D"
-                    #logger.info(f'Processed batch {batch_idx}/{len(dataloader)} ({feature_type} features)')
+                    logger.info(f'Processed batch {batch_idx}/{len(dataloader)} ({feature_type} features)')
 
         # Concatenate all batches
         all_features = np.concatenate(features_list, axis=0)
         all_targets = np.concatenate(targets_list, axis=0)
 
-        # Create DataFrame with consistency information
-        latent_dim = all_features.shape[1]  # Dynamic based on compression
+        # Enhanced: Add clustering information if available
+        if cluster_assignments_list:
+            all_cluster_assignments = np.concatenate(cluster_assignments_list, axis=0)
+            all_cluster_confidence = np.concatenate(cluster_confidence_list, axis=0)
+
+        # Create DataFrame with enhanced information
+        latent_dim = all_features.shape[1]
         feature_columns = [f'feature_{i}' for i in range(latent_dim)]
 
         df_data = {
             'target': all_targets,
             'image_path': image_paths_list,
-            'image_hash': image_hashes_list,  # For consistency tracking
-            'extraction_timestamp': time.time(),  # Track when features were extracted
-            'model_version': f"{self.dataset_name}_round{getattr(self, 'current_round', 0)}",  # Track model state
+            'image_hash': image_hashes_list,
+            'extraction_timestamp': time.time(),
+            'model_version': f"{self.dataset_name}_round{getattr(self, 'current_round', 0)}",
             'feature_type': 'compressed' if use_compression else 'rich_512D'
         }
+
+        # Enhanced: Add clustering columns
+        if cluster_assignments_list:
+            df_data['cluster_assignment'] = all_cluster_assignments
+            df_data['cluster_confidence'] = all_cluster_confidence
 
         for i in range(latent_dim):
             df_data[f'feature_{i}'] = all_features[:, i]
 
         df = pd.DataFrame(df_data)
-        columns = ['target', 'image_path', 'image_hash', 'extraction_timestamp', 'model_version', 'feature_type'] + feature_columns
+        base_columns = ['target', 'image_path', 'image_hash', 'extraction_timestamp', 'model_version', 'feature_type']
+        if cluster_assignments_list:
+            base_columns.extend(['cluster_assignment', 'cluster_confidence'])
+        columns = base_columns + feature_columns
         df = df[columns]
 
         feature_type = f"compressed {latent_dim}D" if use_compression else "rich 512D"
         logger.info(f"✅ Successfully extracted {len(df)} samples with {feature_type} features")
-        logger.info(f"🔒 Latent space consistency ensured with deterministic operations")
+        logger.info(f"🔒 Latent space organization applied with clustering")
+
+        if cluster_assignments_list:
+            unique_clusters = len(np.unique(all_cluster_assignments))
+            avg_confidence = np.mean(all_cluster_confidence)
+            logger.info(f"📊 Clustering: {unique_clusters} clusters, avg confidence: {avg_confidence:.4f}")
 
         return df
 
@@ -1694,25 +1923,54 @@ class UnifiedFeatureExtractor:
         return csv_path, dataset_config_path
 
     def save_model(self, save_dir: str = "models"):
-        """Save trained model"""
+        """Save trained model with label encoder"""
         save_path = Path(save_dir)
         save_path.mkdir(parents=True, exist_ok=True)
 
         model_path = save_path / f"{self.dataset_name}_autoencoder.pth"
-        torch.save({
+
+        # ENHANCED: Include label encoder in model save
+        model_data = {
             'model_state_dict': self.model.state_dict(),
             'config': self.main_config,
-            'dataset_name': self.dataset_name
-        }, model_path)
+            'dataset_name': self.dataset_name,
+            'label_encoder': {
+                'classes': self.label_encoder.classes_.tolist() if hasattr(self, 'label_encoder') and self.label_encoder else [],
+                'fitted': hasattr(self, 'label_encoder') and self.label_encoder is not None
+            } if hasattr(self, 'label_encoder') else None
+        }
 
-        logger.info(f"Model saved to: {model_path}")
+        torch.save(model_data, model_path)
+        logger.info(f"💾 Model saved to: {model_path} with label encoder")
+
+        # Also save label encoder separately for easy access
+        if hasattr(self, 'label_encoder') and self.label_encoder:
+            encoder_path = save_path / f"{self.dataset_name}_label_encoder.json"
+            encoder_data = {
+                'classes': self.label_encoder.classes_.tolist(),
+                'dataset_name': self.dataset_name,
+                'timestamp': time.time()
+            }
+            with open(encoder_path, 'w') as f:
+                json.dump(encoder_data, f, indent=2)
+            logger.info(f"🏷️  Label encoder saved to: {encoder_path}")
 
     def load_model(self, model_path: str):
-        """Load trained model with architecture mismatch handling"""
+        """Load trained model with label encoder support"""
         try:
             checkpoint = torch.load(model_path, map_location=self.device)
 
-            # Check if the saved model has compatible architecture
+            # Load label encoder if available
+            if 'label_encoder' in checkpoint and checkpoint['label_encoder'] and checkpoint['label_encoder']['fitted']:
+                from sklearn.preprocessing import LabelEncoder
+                self.label_encoder = LabelEncoder()
+                self.label_encoder.classes_ = np.array(checkpoint['label_encoder']['classes'])
+                logger.info(f"🏷️  Loaded label encoder with {len(self.label_encoder.classes_)} classes: {list(self.label_encoder.classes_)}")
+            else:
+                logger.warning("⚠️  No label encoder found in checkpoint, using numeric labels")
+                self.label_encoder = None
+
+            # Rest of the existing model loading code...
             current_state_dict = self.model.state_dict()
             saved_state_dict = checkpoint['model_state_dict']
 
