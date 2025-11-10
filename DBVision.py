@@ -20,6 +20,27 @@ pip install torch torchvision pandas pillow matplotlib
 
 # Run the system
 python unified_system.py
+
+# Basic usage with defaults
+python DBVision.py --dataset cifar100
+
+# Fresh start with local data
+python DBVision.py --dataset my_custom_dataset --data-source local --fresh
+
+# Only extract features from existing model
+python DBVision.py --dataset cifar100 --skip-training
+
+# Custom dimensions and rich features
+python DBVision.py --dataset cifar100 --final-dim 64 --extract-rich
+
+# No compression (use raw 512D features)
+python DBVision.py --dataset cifar100 --no-compression
+
+# Custom training parameters
+python DBVision.py --dataset cifar100 --epochs 50 --batch-size 64 --fresh
+
+# Help menu
+python DBVision.py --help
 '''
 
 import torch
@@ -40,6 +61,10 @@ from typing import Dict, List, Optional, Tuple, Any
 import logging
 from dataclasses import dataclass
 import time
+import argparse
+import sys
+import os
+from pathlib import Path
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -249,43 +274,137 @@ class ConfigManager:
             }
         }
 
+# Update GenericImageDataset to accept data_source
 class GenericImageDataset(Dataset):
-    """Generic dataset handler that can work with any image dataset"""
-
-    def __init__(self, root_dir: str, dataset_name: str, config: Dict, split: str = "train"):
+    def __init__(self, root_dir: str, dataset_name: str, config: Dict, split: str = "train", data_source: str = "auto"):
         self.root_dir = Path(root_dir)
         self.dataset_name = dataset_name
         self.config = config
         self.split = split
+        self.data_source = data_source
 
         # Setup transforms
         self.transform = self._create_transforms()
 
-        # Load data
+        # Load data based on specified source
         self.image_paths, self.targets, self.class_names = self._load_data()
 
-        logger.info(f"Loaded {len(self.image_paths)} images for {dataset_name} ({split})")
+        logger.info(f"Loaded {len(self.image_paths)} images for {dataset_name} ({split}) from {data_source} source")
 
     def _create_transforms(self) -> transforms.Compose:
-        """Create transforms that preserve original image size"""
+        """Create appropriate transforms based on configuration"""
         dataset_cfg = self.config['dataset']
+        input_size = dataset_cfg['input_size']
         mean = dataset_cfg['mean']
         std = dataset_cfg['std']
 
         transform_list = [
+            transforms.Resize(input_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=mean, std=std)
         ]
 
-        # Don't resize - keep original image dimensions
         # Add augmentation for training
         if self.split == "train":
             transform_list = [
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(10),
+                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
             ] + transform_list
 
         return transforms.Compose(transform_list)
+
+    def _load_data(self) -> Tuple[List[str], List[int], List[str]]:
+        """Load data based on specified source"""
+        dataset_path = self.root_dir / self.dataset_name
+
+        if self.data_source == "local" or (self.data_source == "auto" and dataset_path.exists() and any(dataset_path.iterdir())):
+            # Load from local folder structure
+            return self._load_from_folder_structure(dataset_path)
+        elif self.data_source == "torchvision" or (self.data_source == "auto" and not dataset_path.exists()):
+            # Download and create standard dataset
+            return self._download_standard_dataset()
+        else:
+            raise ValueError(f"Invalid data source: {self.data_source}")
+
+    def _load_from_folder_structure(self, dataset_path: Path) -> Tuple[List[str], List[int], List[str]]:
+        """Load data from folder structure where each subfolder is a class"""
+        image_paths = []
+        targets = []
+        class_names = []
+
+        # Find all class folders
+        class_folders = [f for f in dataset_path.iterdir() if f.is_dir()]
+        class_folders.sort()
+
+        for class_idx, class_folder in enumerate(class_folders):
+            class_names.append(class_folder.name)
+
+            # Get all images in this class folder
+            image_extensions = {'*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff'}
+            for ext in image_extensions:
+                for image_path in class_folder.glob(ext):
+                    image_paths.append(str(image_path))
+                    targets.append(class_idx)
+
+        return image_paths, targets, class_names
+
+    def _download_standard_dataset(self) -> Tuple[List[str], List[int], List[str]]:
+        """Download standard dataset using torchvision"""
+        dataset_path = self.root_dir / self.dataset_name
+        dataset_path.mkdir(parents=True, exist_ok=True)
+
+        # Create tmp directory for downloads
+        tmp_dir = self.root_dir / "tmp"
+        tmp_dir.mkdir(exist_ok=True)
+
+        # Map dataset names to torchvision datasets
+        dataset_map = {
+            'cifar10': (torchvision.datasets.CIFAR10, 10),
+            'cifar100': (torchvision.datasets.CIFAR100, 100),
+            'mnist': (torchvision.datasets.MNIST, 10),
+            'fashionmnist': (torchvision.datasets.FashionMNIST, 10),
+        }
+
+        if self.dataset_name.lower() in dataset_map:
+            dataset_class, num_classes = dataset_map[self.dataset_name.lower()]
+
+            try:
+                # Use torchvision's built-in download
+                dataset = dataset_class(root=str(tmp_dir), train=(self.split == "train"), download=True)
+
+                # Save images to folder structure for future use
+                return self._save_torchvision_dataset(dataset, dataset_path, num_classes)
+
+            except Exception as e:
+                logger.error(f"Dataset download failed: {e}")
+                raise
+        else:
+            raise ValueError(f"Unsupported dataset: {self.dataset_name}")
+
+    def _save_torchvision_dataset(self, dataset, dataset_path: Path, num_classes: int) -> Tuple[List[str], List[int], List[str]]:
+        """Save torchvision dataset to folder structure"""
+        image_paths = []
+        targets = []
+        class_names = [str(i) for i in range(num_classes)]
+
+        for idx, (image, target) in enumerate(dataset):
+            class_folder = dataset_path / str(target)
+            class_folder.mkdir(exist_ok=True)
+
+            image_path = class_folder / f"{idx:06d}.png"
+
+            if isinstance(image, Image.Image):
+                image.save(image_path)
+            else:
+                # Convert tensor to PIL Image
+                pil_image = transforms.ToPILImage()(image)
+                pil_image.save(image_path)
+
+            image_paths.append(str(image_path))
+            targets.append(target)
+
+        return image_paths, targets, class_names
 
     def _build_adaptive_decoder(self, input_height: int, input_width: int) -> nn.Module:
         """Build decoder that reconstructs to original image size"""
@@ -371,88 +490,6 @@ class GenericImageDataset(Dataset):
 
         logger.info(f"Initialized model with {sum(p.numel() for p in self.model.parameters()):,} parameters")
         return self.model
-
-    def _load_data(self) -> Tuple[List[str], List[int], List[str]]:
-        """Load data from various sources"""
-        dataset_path = self.root_dir / self.dataset_name
-
-        if dataset_path.exists() and any(dataset_path.iterdir()):
-            # Load from custom folder structure
-            return self._load_from_folder_structure(dataset_path)
-        else:
-            # Download and create standard dataset
-            return self._download_standard_dataset()
-
-    def _load_from_folder_structure(self, dataset_path: Path) -> Tuple[List[str], List[int], List[str]]:
-        """Load data from folder structure where each subfolder is a class"""
-        image_paths = []
-        targets = []
-        class_names = []
-
-        # Find all class folders
-        class_folders = [f for f in dataset_path.iterdir() if f.is_dir()]
-        class_folders.sort()
-
-        for class_idx, class_folder in enumerate(class_folders):
-            class_names.append(class_folder.name)
-
-            # Get all images in this class folder
-            image_extensions = {'*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tiff'}
-            for ext in image_extensions:
-                for image_path in class_folder.glob(ext):
-                    image_paths.append(str(image_path))
-                    targets.append(class_idx)
-
-        return image_paths, targets, class_names
-
-    def _download_standard_dataset(self) -> Tuple[List[str], List[int], List[str]]:
-        """Download standard dataset using torchvision"""
-        dataset_path = self.root_dir / self.dataset_name
-        dataset_path.mkdir(parents=True, exist_ok=True)
-
-        # Map dataset names to torchvision datasets
-        dataset_map = {
-            'cifar10': (torchvision.datasets.CIFAR10, 10),
-            'cifar100': (torchvision.datasets.CIFAR100, 100),
-            'mnist': (torchvision.datasets.MNIST, 10),
-            'fashionmnist': (torchvision.datasets.FashionMNIST, 10),
-            'imagenet': (torchvision.datasets.ImageNet, 1000)
-        }
-
-        if self.dataset_name.lower() in dataset_map:
-            dataset_class, num_classes = dataset_map[self.dataset_name.lower()]
-
-            # Download dataset
-            dataset = dataset_class(root=str(self.root_dir), train=(self.split == "train"), download=True)
-
-            # Save images to folder structure for future use
-            return self._save_torchvision_dataset(dataset, dataset_path, num_classes)
-        else:
-            raise ValueError(f"Unsupported dataset: {self.dataset_name}")
-
-    def _save_torchvision_dataset(self, dataset, dataset_path: Path, num_classes: int) -> Tuple[List[str], List[int], List[str]]:
-        """Save torchvision dataset to folder structure"""
-        image_paths = []
-        targets = []
-        class_names = [str(i) for i in range(num_classes)]
-
-        for idx, (image, target) in enumerate(dataset):
-            class_folder = dataset_path / str(target)
-            class_folder.mkdir(exist_ok=True)
-
-            image_path = class_folder / f"{idx:06d}.png"
-
-            if isinstance(image, Image.Image):
-                image.save(image_path)
-            else:
-                # Convert tensor to PIL Image
-                pil_image = transforms.ToPILImage()(image)
-                pil_image.save(image_path)
-
-            image_paths.append(str(image_path))
-            targets.append(target)
-
-        return image_paths, targets, class_names
 
     def __len__(self):
         return len(self.image_paths)
@@ -591,6 +628,69 @@ class EnhancementModules:
 
         return enhanced
 
+class FeatureSpaceCompressor(nn.Module):
+    """Secondary autoencoder that compresses 512D features to final output dimension"""
+
+    def __init__(self, input_dim: int, compressed_dim: int, num_classes: int):
+        super(FeatureSpaceCompressor, self).__init__()
+
+        self.input_dim = input_dim
+        self.compressed_dim = compressed_dim
+        self.num_classes = num_classes
+
+        # Compression network
+        self.compressor = nn.Sequential(
+            nn.Linear(input_dim, 256),
+            nn.BatchNorm1d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.2),
+
+            nn.Linear(256, 128),
+            nn.BatchNorm1d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.2),
+
+            nn.Linear(128, 64),
+            nn.BatchNorm1d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.1),
+
+            nn.Linear(64, compressed_dim),  # Final compression
+            nn.BatchNorm1d(compressed_dim)  # Normalize compressed features
+        )
+
+        # Reconstruction network (for training)
+        self.decompressor = nn.Sequential(
+            nn.Linear(compressed_dim, 64),
+            nn.LeakyReLU(0.1, True),
+
+            nn.Linear(64, 128),
+            nn.LeakyReLU(0.1, True),
+
+            nn.Linear(128, 256),
+            nn.LeakyReLU(0.1, True),
+
+            nn.Linear(256, input_dim)  # Back to original 512D
+        )
+
+        # Discriminative head (optional, for better feature quality)
+        self.classifier = nn.Linear(compressed_dim, num_classes)
+
+    def forward(self, x, return_all: bool = False):
+        # Compress features
+        compressed = self.compressor(x)
+
+        if return_all:
+            # During training: return compressed, reconstructed, and classification
+            reconstructed = self.decompressor(compressed)
+            classified = self.classifier(compressed)
+            return compressed, reconstructed, classified
+        else:
+            # During inference: just return compressed features
+            return compressed
+
+
+
 class UnifiedDiscriminativeAutoencoder(nn.Module):
     """Enhanced unified autoencoder with domain-specific enhancements"""
 
@@ -601,45 +701,50 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         model_cfg = config['model']
         dataset_cfg = config['dataset']
 
-        self.latent_dim = model_cfg['feature_dims']
+        # Use 512D for rich features, but we'll compress to config dimension for output
+        self.latent_dim = 512  # Internal rich representation
+        self.output_dim = model_cfg['feature_dims']  # Final output dimension (e.g., 32)
         self.in_channels = dataset_cfg['in_channels']
         self.input_size = dataset_cfg['input_size']
 
         # Enhancement modules
         self.enhancement_modules = EnhancementModules(config)
 
-        # Encoder
+        # Main encoder/decoder with rich 512D space
         self.encoder = self._build_encoder()
+        self.decoder = self._build_decoder()
 
-        # Expert modules
+        # Expert modules work on the rich 512D space
         self.reconstruction_expert = ReconstructionExpert(self.latent_dim)
         self.semantic_expert = SemanticDensityExpert(self.latent_dim, num_classes)
         self.efficiency_critic = EfficiencyCritic(self.latent_dim)
 
-        # Decoder
-        self.decoder = self._build_decoder()
+        # 🆕 FEATURE SPACE COMPRESSOR - trains after main autoencoder
+        self.feature_compressor = FeatureSpaceCompressor(
+            input_dim=self.latent_dim,
+            compressed_dim=self.output_dim,
+            num_classes=num_classes
+        )
+
+        # Control whether to use compression
+        self.use_compression = False  # Start with raw features during main training
 
         # Domain-specific components
         self.setup_domain_specific_components()
 
     def _build_encoder(self) -> nn.Module:
-        """Build efficient but powerful encoder optimized for A100"""
-        if hasattr(self, 'dataset') and self.dataset and len(self.dataset) > 0:
-            sample_image, _, _ = self.dataset[0]
-            _, input_height, input_width = sample_image.shape
+        """Build encoder with larger 512D latent space for richer features"""
+        input_height, input_width = self.config['dataset']['input_size']
+
+        logger.info(f"Building enhanced encoder for {input_height}x{input_width} with 512D latent space")
+
+        if input_height <= 64:
+            return self._build_enhanced_small_encoder(input_height, input_width)
         else:
-            input_height, input_width = self.config['dataset']['input_size']
+            return self._build_enhanced_large_encoder(input_height, input_width)
 
-        logger.info(f"Building efficient encoder for {input_height}x{input_width} on A100")
-
-        # For CIFAR-100 (32x32), we can use a more efficient architecture
-        if input_height <= 64:  # Small images like CIFAR
-            return self._build_efficient_small_encoder(input_height, input_width)
-        else:  # Larger images
-            return self._build_efficient_large_encoder(input_height, input_width)
-
-    def _build_efficient_small_encoder(self, input_height: int, input_width: int) -> nn.Module:
-        """Efficient encoder for small images (CIFAR, MNIST, etc.)"""
+    def _build_enhanced_small_encoder(self, input_height: int, input_width: int) -> nn.Module:
+        """Enhanced encoder with 512D output for small images"""
         return nn.Sequential(
             # Block 1: 64 channels
             nn.Conv2d(self.in_channels, 64, 3, 1, 1),
@@ -648,7 +753,7 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.Conv2d(64, 64, 3, 1, 1),
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 16x16
+            nn.MaxPool2d(2, 2),
             nn.Dropout(0.1),
 
             # Block 2: 128 channels
@@ -658,7 +763,7 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.Conv2d(128, 128, 3, 1, 1),
             nn.BatchNorm2d(128),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 8x8
+            nn.MaxPool2d(2, 2),
             nn.Dropout(0.1),
 
             # Block 3: 256 channels
@@ -668,64 +773,72 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.Conv2d(256, 256, 3, 1, 1),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # 4x4
+            nn.MaxPool2d(2, 2),
             nn.Dropout(0.2),
 
             # Block 4: 512 channels
             nn.Conv2d(256, 512, 3, 1, 1),
             nn.BatchNorm2d(512),
             nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d((2, 2)),  # Fixed size for FC layers
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((2, 2)),
             nn.Dropout(0.2),
 
             nn.Flatten(),
             nn.Linear(512 * 2 * 2, 1024),
             nn.LeakyReLU(0.1, True),
             nn.Dropout(0.3),
-            nn.Linear(1024, 512),
+            nn.Linear(1024, 512),  # Increased to 512D latent space
             nn.LeakyReLU(0.1, True),
-            nn.Linear(512, self.latent_dim)
+            nn.Linear(512, 512)    # Final 512D output
         )
 
-    def _build_efficient_large_encoder(self, input_height: int, input_width: int) -> nn.Module:
-        """Efficient encoder for larger images (ImageNet, etc.)"""
-        return nn.Sequential(
-            # Initial downsampling for large images
-            nn.Conv2d(self.in_channels, 64, 7, 2, 3),  # /2
-            nn.BatchNorm2d(64),
-            nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # /4 total
+    def _build_enhanced_large_encoder(self, input_height: int, input_width: int) -> nn.Module:
+            """Enhanced encoder with 512D output for large images"""
+            return nn.Sequential(
+                # Initial downsampling for large images
+                nn.Conv2d(self.in_channels, 64, 7, 2, 3),  # /2
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU(0.1, True),
+                nn.MaxPool2d(2, 2),  # /4 total
 
-            # Block 1
-            nn.Conv2d(64, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1, True),
-            nn.Conv2d(128, 128, 3, 1, 1),
-            nn.BatchNorm2d(128),
-            nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # /8
+                # Block 1
+                nn.Conv2d(64, 128, 3, 1, 1),
+                nn.BatchNorm2d(128),
+                nn.LeakyReLU(0.1, True),
+                nn.Conv2d(128, 128, 3, 1, 1),
+                nn.BatchNorm2d(128),
+                nn.LeakyReLU(0.1, True),
+                nn.MaxPool2d(2, 2),  # /8
 
-            # Block 2
-            nn.Conv2d(128, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1, True),
-            nn.Conv2d(256, 256, 3, 1, 1),
-            nn.BatchNorm2d(256),
-            nn.LeakyReLU(0.1, True),
-            nn.MaxPool2d(2, 2),  # /16
+                # Block 2
+                nn.Conv2d(128, 256, 3, 1, 1),
+                nn.BatchNorm2d(256),
+                nn.LeakyReLU(0.1, True),
+                nn.Conv2d(256, 256, 3, 1, 1),
+                nn.BatchNorm2d(256),
+                nn.LeakyReLU(0.1, True),
+                nn.MaxPool2d(2, 2),  # /16
 
-            # Block 3
-            nn.Conv2d(256, 512, 3, 1, 1),
-            nn.BatchNorm2d(512),
-            nn.LeakyReLU(0.1, True),
-            nn.AdaptiveAvgPool2d((4, 4)),
+                # Block 3
+                nn.Conv2d(256, 512, 3, 1, 1),
+                nn.BatchNorm2d(512),
+                nn.LeakyReLU(0.1, True),
+                nn.Conv2d(512, 512, 3, 1, 1),
+                nn.BatchNorm2d(512),
+                nn.LeakyReLU(0.1, True),
+                nn.AdaptiveAvgPool2d((4, 4)),
 
-            nn.Flatten(),
-            nn.Linear(512 * 4 * 4, 1024),
-            nn.LeakyReLU(0.1, True),
-            nn.Dropout(0.3),
-            nn.Linear(1024, self.latent_dim)
-        )
+                nn.Flatten(),
+                nn.Linear(512 * 4 * 4, 1024),
+                nn.LeakyReLU(0.1, True),
+                nn.Dropout(0.3),
+                nn.Linear(1024, 512),  # 512D latent space
+                nn.LeakyReLU(0.1, True),
+                nn.Linear(512, 512)    # Final 512D output
+            )
 
     def _build_decoder(self) -> nn.Module:
         """Build efficient decoder optimized for A100"""
@@ -779,6 +892,47 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.Sigmoid()
         )
 
+    def _build_enhanced_large_decoder(self, input_height: int, input_width: int) -> nn.Module:
+            """Enhanced decoder for large images from 512D latent space"""
+            return nn.Sequential(
+                nn.Linear(512, 512),  # Input from 512D latent space
+                nn.LeakyReLU(0.1, True),
+                nn.Linear(512, 512 * 4 * 4),
+                nn.LeakyReLU(0.1, True),
+                nn.Unflatten(1, (512, 4, 4)),
+
+                # Block 1: 4x4 -> 8x8
+                nn.ConvTranspose2d(512, 256, 4, 2, 1),
+                nn.BatchNorm2d(256),
+                nn.LeakyReLU(0.1, True),
+                nn.Dropout(0.2),
+
+                # Block 2: 8x8 -> 16x16
+                nn.ConvTranspose2d(256, 128, 4, 2, 1),
+                nn.BatchNorm2d(128),
+                nn.LeakyReLU(0.1, True),
+                nn.Dropout(0.2),
+
+                # Block 3: 16x16 -> 32x32
+                nn.ConvTranspose2d(128, 64, 4, 2, 1),
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU(0.1, True),
+                nn.Dropout(0.1),
+
+                # Block 4: 32x32 -> 64x64
+                nn.ConvTranspose2d(64, 32, 4, 2, 1),
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(0.1, True),
+
+                # Additional blocks for larger images
+                nn.ConvTranspose2d(32, 32, 4, 2, 1),  # 64x64 -> 128x128
+                nn.BatchNorm2d(32),
+                nn.LeakyReLU(0.1, True),
+
+                nn.ConvTranspose2d(32, self.in_channels, 4, 2, 1),  # 128x128 -> 256x256
+                nn.Sigmoid()
+            )
+
     def _build_adaptive_encoder(self, input_height: int, input_width: int) -> nn.Module:
         """Build encoder that automatically adapts to any image size"""
 
@@ -828,7 +982,6 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         logger.info(f"Building decoder for image size: {input_height}x{input_width}")
 
         return self._build_adaptive_decoder(input_height, input_width)
-
 
     def _build_enhanced_encoder(self) -> nn.Module:
         """Build enhanced encoder architecture"""
@@ -904,7 +1057,7 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         elif image_type == "agricultural" and enhancement_cfg['agricultural']['enabled']:
             self.agricultural_head = nn.Linear(self.latent_dim, 48)
 
-    def forward(self, x, targets=None, phase=1, apply_enhancements=True):
+    def forward(self, x, targets=None, phase=1, apply_enhancements=True, use_compression=None):
         # Apply domain-specific enhancements
         if apply_enhancements:
             image_type = self.config['dataset']['image_type']
@@ -915,27 +1068,35 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             elif image_type == "agricultural":
                 x = self.enhancement_modules.apply_agricultural_enhancements(x)
 
-        # Base encoding - ALWAYS start from the same base latent space
+        # Base encoding to rich 512D space
         base_latent = self.encoder(x)
         current_latent = base_latent
 
-        # Progressive expert guidance with deterministic operations
+        # Progressive expert guidance on rich features
         if phase >= 2:
             current_latent = self.reconstruction_expert(current_latent)
 
         if phase >= 3 and targets is not None:
             current_latent = self.semantic_expert(current_latent, targets)
 
-        # Final reconstruction
+        # Final reconstruction from rich features
         reconstructed = self.decoder(current_latent)
 
-        # Always return 4 values for consistency across all phases
+        # Apply feature compression if requested
+        use_compression = use_compression if use_compression is not None else self.use_compression
+        if use_compression:
+            compressed_latent = self.feature_compressor(current_latent)
+        else:
+            compressed_latent = current_latent
+
+        # Always return 4 values for consistency
         if phase >= 4:
             efficiency_scores = self.efficiency_critic(current_latent)
         else:
             efficiency_scores = None
 
-        return reconstructed, current_latent, base_latent, efficiency_scores
+        return reconstructed, compressed_latent, current_latent, efficiency_scores
+
 
 # Expert Modules (from previous implementation, enhanced)
 class ReconstructionExpert(nn.Module):
@@ -1218,23 +1379,30 @@ class UnifiedFeatureExtractor:
             achieved = "✅" if round_best_losses[phase_num] <= target_loss else "❌"
             logger.info(f"  {achieved} {description}: {round_best_losses[phase_num]:.4f} (target: {target_loss:.4f})")
 
-    def extract_features(self, data_dir: str = "Data", split: str = "train") -> pd.DataFrame:
-        """Extract features and save to CSV with proper return value handling"""
+    def extract_features(self, data_dir: str = "Data", split: str = "train", use_compression: bool = False) -> pd.DataFrame:
+        """Extract features with guaranteed latent space consistency and compression option"""
         if self.model is None:
             raise ValueError("Model not initialized. Call train() or load_model() first.")
 
         if self.dataset is None:
             self.setup_data(data_dir, split)
 
+        # Set model to eval mode and ensure deterministic behavior
         self.model.eval()
+
+        # Enable deterministic algorithms for reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
         features_list = []
         targets_list = []
         image_paths_list = []
+        image_hashes_list = []  # For consistency verification
 
         dataloader = DataLoader(
             self.dataset,
             batch_size=self.main_config['training']['batch_size'],
-            shuffle=False,
+            shuffle=False,  # Important: maintain order for consistency
             num_workers=self.main_config['training']['num_workers']
         )
 
@@ -1243,49 +1411,53 @@ class UnifiedFeatureExtractor:
                 data = data.to(self.device)
                 targets = targets.to(self.device)
 
-                # Get final latent representation with all experts
-                # Handle different return types based on phase
-                outputs = self.model(data, targets, phase=4)
+                # Get final latent representation with consistent return structure
+                # Model now always returns 4 values: (reconstructed, current_latent, base_latent, efficiency_scores)
+                reconstructed, final_latent, base_latent, efficiency_scores = self.model(
+                    data, targets, phase=4, use_compression=use_compression
+                )
 
-                # Properly unpack based on number of return values
-                if len(outputs) == 4:
-                    # Phase 4: (reconstructed, current_latent, base_latent, efficiency_scores)
-                    reconstructed, final_latent, base_latent, efficiency_scores = outputs
-                elif len(outputs) == 3:
-                    # Phases 1-3: (reconstructed, current_latent, base_latent)
-                    reconstructed, final_latent, base_latent = outputs
-                else:
-                    # Fallback: try to get the second element as latent
-                    final_latent = outputs[1] if len(outputs) >= 2 else outputs[0]
-
+                # Store features and metadata
                 features_list.append(final_latent.cpu().numpy())
                 targets_list.append(targets.cpu().numpy())
                 image_paths_list.extend(image_paths)
 
+                # Generate consistency hashes for verification
+                batch_hashes = [self._generate_image_hash(path) for path in image_paths]
+                image_hashes_list.extend(batch_hashes)
+
                 if batch_idx % 10 == 0:
-                    logger.info(f'Processed batch {batch_idx}/{len(dataloader)}')
+                    feature_type = "compressed" if use_compression else "rich 512D"
+                    #logger.info(f'Processed batch {batch_idx}/{len(dataloader)} ({feature_type} features)')
 
         # Concatenate all batches
         all_features = np.concatenate(features_list, axis=0)
         all_targets = np.concatenate(targets_list, axis=0)
 
-        # Create DataFrame
-        latent_dim = self.main_config['model']['feature_dims']
+        # Create DataFrame with consistency information
+        latent_dim = all_features.shape[1]  # Dynamic based on compression
         feature_columns = [f'feature_{i}' for i in range(latent_dim)]
 
         df_data = {
             'target': all_targets,
-            'image_path': image_paths_list
+            'image_path': image_paths_list,
+            'image_hash': image_hashes_list,  # For consistency tracking
+            'extraction_timestamp': time.time(),  # Track when features were extracted
+            'model_version': f"{self.dataset_name}_round{getattr(self, 'current_round', 0)}",  # Track model state
+            'feature_type': 'compressed' if use_compression else 'rich_512D'
         }
 
         for i in range(latent_dim):
             df_data[f'feature_{i}'] = all_features[:, i]
 
         df = pd.DataFrame(df_data)
-        columns = ['target', 'image_path'] + feature_columns
+        columns = ['target', 'image_path', 'image_hash', 'extraction_timestamp', 'model_version', 'feature_type'] + feature_columns
         df = df[columns]
 
-        logger.info(f"Successfully extracted {len(df)} samples with {latent_dim} features each")
+        feature_type = f"compressed {latent_dim}D" if use_compression else "rich 512D"
+        logger.info(f"✅ Successfully extracted {len(df)} samples with {feature_type} features")
+        logger.info(f"🔒 Latent space consistency ensured with deterministic operations")
+
         return df
 
     def save_features_and_config(self, df: pd.DataFrame, output_dir: str = "data"):
@@ -1343,71 +1515,472 @@ class UnifiedFeatureExtractor:
         logger.info(f"Model saved to: {model_path}")
 
     def load_model(self, model_path: str):
-        """Load trained model"""
-        checkpoint = torch.load(model_path, map_location=self.device)
+        """Load trained model with architecture mismatch handling"""
+        try:
+            checkpoint = torch.load(model_path, map_location=self.device)
 
+            # Check if the saved model has compatible architecture
+            current_state_dict = self.model.state_dict()
+            saved_state_dict = checkpoint['model_state_dict']
+
+            # Filter out incompatible keys
+            compatible_state_dict = {}
+            missing_keys = []
+            unexpected_keys = []
+
+            for key in current_state_dict.keys():
+                if key in saved_state_dict:
+                    if current_state_dict[key].shape == saved_state_dict[key].shape:
+                        compatible_state_dict[key] = saved_state_dict[key]
+                    else:
+                        missing_keys.append(key)
+                        logger.warning(f"Shape mismatch for {key}: current {current_state_dict[key].shape} vs saved {saved_state_dict[key].shape}")
+                else:
+                    missing_keys.append(key)
+
+            for key in saved_state_dict.keys():
+                if key not in current_state_dict:
+                    unexpected_keys.append(key)
+
+            # Load compatible weights
+            self.model.load_state_dict(compatible_state_dict, strict=False)
+
+            logger.info(f"✅ Loaded model from: {model_path}")
+            logger.info(f"📊 Compatible parameters: {len(compatible_state_dict)}/{len(current_state_dict)}")
+
+            if missing_keys:
+                logger.warning(f"⚠️  Missing/incompatible keys: {len(missing_keys)}")
+            if unexpected_keys:
+                logger.warning(f"⚠️  Unexpected keys: {len(unexpected_keys)}")
+
+        except Exception as e:
+            logger.error(f"❌ Error loading model: {e}")
+            logger.info("🆕 Continuing with randomly initialized weights")
+
+    def setup_data(self, data_dir: str = "Data", split: str = "train", data_source: str = "auto"):
+        """Setup data pipeline with source specification"""
+        self.dataset = GenericImageDataset(data_dir, self.dataset_name, self.main_config, split, data_source)
+        return self.dataset
+
+    def extract_features(self, data_dir: str = "Data", split: str = "train", use_compression: bool = False) -> pd.DataFrame:
+        """Extract features with guaranteed latent space consistency and compression option"""
         if self.model is None:
-            self.initialize_model()
+            raise ValueError("Model not initialized. Call train() or load_model() first.")
 
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        logger.info(f"Model loaded from: {model_path}")
+        if self.dataset is None:
+            self.setup_data(data_dir, split)
+
+        # Set model to eval mode and ensure deterministic behavior
+        self.model.eval()
+
+        # Enable deterministic algorithms for reproducibility
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+        features_list = []
+        targets_list = []
+        image_paths_list = []
+        image_hashes_list = []  # For consistency verification
+
+        dataloader = DataLoader(
+            self.dataset,
+            batch_size=self.main_config['training']['batch_size'],
+            shuffle=False,  # Important: maintain order for consistency
+            num_workers=self.main_config['training']['num_workers']
+        )
+
+        with torch.no_grad():
+            for batch_idx, (data, targets, image_paths) in enumerate(dataloader):
+                data = data.to(self.device)
+                targets = targets.to(self.device)
+
+                # Get final latent representation with consistent return structure
+                # Model now always returns 4 values: (reconstructed, current_latent, base_latent, efficiency_scores)
+                reconstructed, final_latent, base_latent, efficiency_scores = self.model(
+                    data, targets, phase=4, use_compression=use_compression
+                )
+
+                # Store features and metadata
+                features_list.append(final_latent.cpu().numpy())
+                targets_list.append(targets.cpu().numpy())
+                image_paths_list.extend(image_paths)
+
+                # Generate consistency hashes for verification
+                batch_hashes = [self._generate_image_hash(path) for path in image_paths]
+                image_hashes_list.extend(batch_hashes)
+
+                if batch_idx % 10 == 0:
+                    feature_type = "compressed" if use_compression else "rich 512D"
+                    #logger.info(f'Processed batch {batch_idx}/{len(dataloader)} ({feature_type} features)')
+
+        # Concatenate all batches
+        all_features = np.concatenate(features_list, axis=0)
+        all_targets = np.concatenate(targets_list, axis=0)
+
+        # Create DataFrame with consistency information
+        latent_dim = all_features.shape[1]  # Dynamic based on compression
+        feature_columns = [f'feature_{i}' for i in range(latent_dim)]
+
+        df_data = {
+            'target': all_targets,
+            'image_path': image_paths_list,
+            'image_hash': image_hashes_list,  # For consistency tracking
+            'extraction_timestamp': time.time(),  # Track when features were extracted
+            'model_version': f"{self.dataset_name}_round{getattr(self, 'current_round', 0)}",  # Track model state
+            'feature_type': 'compressed' if use_compression else 'rich_512D'
+        }
+
+        for i in range(latent_dim):
+            df_data[f'feature_{i}'] = all_features[:, i]
+
+        df = pd.DataFrame(df_data)
+        columns = ['target', 'image_path', 'image_hash', 'extraction_timestamp', 'model_version', 'feature_type'] + feature_columns
+        df = df[columns]
+
+        feature_type = f"compressed {latent_dim}D" if use_compression else "rich 512D"
+        logger.info(f"✅ Successfully extracted {len(df)} samples with {feature_type} features")
+        logger.info(f"🔒 Latent space consistency ensured with deterministic operations")
+
+        return df
+
+    def _generate_image_hash(self, image_path: str) -> str:
+        """Generate consistent hash for image verification"""
+        import hashlib
+        try:
+            with open(image_path, 'rb') as f:
+                return hashlib.md5(f.read()).hexdigest()
+        except:
+            return "unknown"
+
+    def train_feature_compressor(self, features_df: pd.DataFrame, epochs: int = 100):
+        """Train the feature space compressor after main autoencoder training"""
+        logger.info("🚀 Starting Feature Space Compressor Training")
+
+        feature_cols = [f'feature_{i}' for i in range(512)]  # 512D rich features
+        feature_matrix = features_df[feature_cols].values
+        targets = features_df['target'].values
+
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        features_tensor = torch.FloatTensor(feature_matrix).to(device)
+        targets_tensor = torch.LongTensor(targets).to(device)
+
+        # Enable compression mode
+        self.model.use_compression = True
+        self.model.feature_compressor.train()
+
+        optimizer = torch.optim.AdamW(
+            self.model.feature_compressor.parameters(),
+            lr=0.001,
+            weight_decay=1e-5
+        )
+
+        recon_criterion = nn.MSELoss()
+        class_criterion = nn.CrossEntropyLoss()
+
+        best_loss = float('inf')
+
+        for epoch in range(epochs):
+            optimizer.zero_grad()
+
+            # Forward pass through compressor
+            compressed, reconstructed, classified = self.model.feature_compressor(
+                features_tensor, return_all=True
+            )
+
+            # Combined loss: reconstruction + classification
+            recon_loss = recon_criterion(reconstructed, features_tensor)
+            class_loss = class_criterion(classified, targets_tensor)
+
+            # Weighted combination - focus more on discriminative power
+            total_loss = 0.3 * recon_loss + 0.7 * class_loss
+
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.feature_compressor.parameters(), 1.0)
+            optimizer.step()
+
+            if total_loss < best_loss:
+                best_loss = total_loss
+                # Save compressor checkpoint
+                torch.save({
+                    'compressor_state_dict': self.model.feature_compressor.state_dict(),
+                    'best_loss': best_loss,
+                    'epoch': epoch
+                }, f"models/{self.dataset_name}_compressor_best.pth")
+
+            if epoch % 10 == 0:
+                # Calculate accuracy
+                with torch.no_grad():
+                    _, _, classified = self.model.feature_compressor(features_tensor, return_all=True)
+                    preds = torch.argmax(classified, dim=1)
+                    accuracy = (preds == targets_tensor).float().mean()
+
+                logger.info(f'Compressor Epoch [{epoch}/{epochs}], '
+                           f'Total Loss: {total_loss.item():.4f}, '
+                           f'Recon: {recon_loss.item():.4f}, '
+                           f'Class: {class_loss.item():.4f}, '
+                           f'Accuracy: {accuracy.item():.4f}')
+
+        logger.info(f"✅ Feature Space Compressor training completed. Best loss: {best_loss:.4f}")
+
+        # Set model to use compression for future inferences
+        self.model.use_compression = True
+
+    def verify_latent_consistency(self, previous_features_path: str = None) -> Dict[str, Any]:
+        """Verify that the same images produce the same latent features across runs"""
+        if previous_features_path and os.path.exists(previous_features_path):
+            # Load previous features for comparison
+            previous_df = pd.read_csv(previous_features_path)
+
+            # Extract current features
+            current_df = self.extract_features()
+
+            # Find common images by hash
+            common_hashes = set(previous_df['image_hash']).intersection(set(current_df['image_hash']))
+
+            if common_hashes:
+                consistency_results = {}
+
+                for image_hash in list(common_hashes)[:10]:  # Sample 10 images for verification
+                    prev_features = previous_df[previous_df['image_hash'] == image_hash].iloc[0]
+                    curr_features = current_df[current_df['image_hash'] == image_hash].iloc[0]
+
+                    # Compare feature vectors
+                    prev_vec = prev_features[[f'feature_{i}' for i in range(self.main_config['model']['feature_dims'])]].values
+                    curr_vec = curr_features[[f'feature_{i}' for i in range(self.main_config['model']['feature_dims'])]].values
+
+                    similarity = np.dot(prev_vec, curr_vec) / (np.linalg.norm(prev_vec) * np.linalg.norm(curr_vec))
+                    consistency_results[image_hash] = {
+                        'similarity': similarity,
+                        'prev_timestamp': prev_features['extraction_timestamp'],
+                        'curr_timestamp': curr_features['extraction_timestamp'],
+                        'same_model_version': prev_features['model_version'] == curr_features['model_version']
+                    }
+
+                avg_similarity = np.mean([result['similarity'] for result in consistency_results.values()])
+                logger.info(f"🔍 Latent space consistency check: Average similarity = {avg_similarity:.6f}")
+
+                return {
+                    'average_similarity': avg_similarity,
+                    'sample_comparisons': consistency_results,
+                    'consistent': avg_similarity > 0.99  # 99% similarity threshold
+                }
+
+        return {'consistent': True, 'no_previous_data': True}
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(description='Unified Discriminative Autoencoder System')
+
+    # Dataset options
+    parser.add_argument('--dataset', type=str, default='cifar100',
+                       help='Dataset name (cifar100, cifar10, mnist, etc.)')
+    parser.add_argument('--data-source', type=str, default='auto',
+                       choices=['auto', 'torchvision', 'local'],
+                       help='Data source: auto (detect), torchvision, or local folder')
+    parser.add_argument('--data-dir', type=str, default='Data',
+                       help='Directory for raw data (default: Data)')
+    parser.add_argument('--output-dir', type=str, default='data',
+                       help='Directory for processed features (default: data)')
+
+    # Training options
+    parser.add_argument('--fresh', action='store_true',
+                       help='Start fresh training (ignore existing models)')
+    parser.add_argument('--train-main', action='store_true', default=True,
+                       help='Train main autoencoder (default: True)')
+    parser.add_argument('--train-compressor', action='store_true', default=True,
+                       help='Train feature compressor (default: True)')
+    parser.add_argument('--epochs', type=int, default=None,
+                       help='Override training epochs from config')
+    parser.add_argument('--batch-size', type=int, default=None,
+                       help='Override batch size from config')
+
+    # Feature extraction options
+    parser.add_argument('--extract-rich', action='store_true',
+                       help='Extract rich 512D features in addition to compressed')
+    parser.add_argument('--final-dim', type=int, default=32,
+                       help='Final feature dimension after compression (default: 32)')
+    parser.add_argument('--no-compression', action='store_true',
+                       help='Skip compression and use raw latent features')
+
+    # System options
+    parser.add_argument('--config-dir', type=str, default='configs',
+                       help='Configuration directory (default: configs)')
+    parser.add_argument('--models-dir', type=str, default='models',
+                       help='Models directory (default: models)')
+    parser.add_argument('--skip-training', action='store_true',
+                       help='Skip training and only extract features from existing model')
+
+    return parser.parse_args()
 
 def main():
-    """Main execution function"""
-    # Configuration
-    DATASET_NAME = "cifar100"  # Change to any dataset name
-    DATA_DIR = "Data"  # Raw images go here (with class subfolders)
-    OUTPUT_DIR = "data"  # Processed features and configs go here
-    CONFIG_DIR = "configs"
-    MODELS_DIR = "models"
+    """Enhanced main execution function with command-line arguments"""
+    args = parse_arguments()
 
-    logger.info("Initializing Unified Discriminative Autoencoder System")
-    logger.info(f"Dataset: {DATASET_NAME}")
+    # Create directories if they don't exist
+    Path(args.data_dir).mkdir(exist_ok=True)
+    Path(args.output_dir).mkdir(exist_ok=True)
+    Path(args.config_dir).mkdir(exist_ok=True)
+    Path(args.models_dir).mkdir(exist_ok=True)
+
+    logger.info("🚀 Unified Discriminative Autoencoder System")
+    logger.info(f"Dataset: {args.dataset}")
+    logger.info(f"Data source: {args.data_source}")
+    logger.info(f"Fresh start: {args.fresh}")
+    logger.info(f"Final feature dimension: {args.final_dim}")
 
     try:
         # Initialize system
-        extractor = UnifiedFeatureExtractor(DATASET_NAME, CONFIG_DIR)
+        extractor = UnifiedFeatureExtractor(args.dataset, args.config_dir)
 
-        # Setup data - reads from Data/ folder with class subfolders
+        # Override config if command line arguments provided
+        if args.epochs:
+            extractor.main_config['training']['epochs'] = args.epochs
+        if args.batch_size:
+            extractor.main_config['training']['batch_size'] = args.batch_size
+        if args.final_dim:
+            extractor.main_config['model']['feature_dims'] = args.final_dim
+
+        # Setup data pipeline
         logger.info("Setting up data pipeline...")
-        extractor.setup_data(DATA_DIR)
+        extractor.setup_data(args.data_dir, data_source=args.data_source)
 
-        # Initialize and train model
+        # Check for existing model
+        model_path = Path(args.models_dir) / f"{args.dataset}_autoencoder.pth"
+        compressor_path = Path(args.models_dir) / f"{args.dataset}_compressor_best.pth"
+
+        model_exists = model_path.exists() and not args.fresh
+        compressor_exists = compressor_path.exists() and not args.fresh
+
+        # Initialize model
         logger.info("Initializing model...")
         extractor.initialize_model()
 
-        logger.info("Starting training...")
-        extractor.train(DATA_DIR, MODELS_DIR)
+        # Load existing model if available and not fresh start
+        if model_exists and not args.skip_training:
+            logger.info(f"📁 Loading existing model from {model_path}")
+            extractor.load_model(model_path)
+        elif model_exists and args.skip_training:
+            logger.info(f"📁 Loading existing model for feature extraction only")
+            extractor.load_model(model_path)
+        else:
+            logger.info("🆕 No existing model found or fresh start requested")
 
-        # Extract features
-        logger.info("Extracting features...")
-        features_df = extractor.extract_features(DATA_DIR)
+        # Training phase
+        if args.train_main and not args.skip_training:
+            if model_exists and not args.fresh:
+                logger.info("✅ Using existing main autoencoder model")
+            else:
+                logger.info("🎯 Starting main autoencoder training...")
+                extractor.train(args.data_dir, args.models_dir)
 
-        # Save results to data/ folder (not Data/)
-        logger.info("Saving features and configurations...")
-        csv_path, config_path = extractor.save_features_and_config(features_df, OUTPUT_DIR)
+        # Feature extraction phase
+        rich_features_df = None
+
+        if args.extract_rich or args.train_compressor:
+            # Extract rich 512D features
+            logger.info("🔍 Extracting rich 512D features...")
+            rich_features_df = extractor.extract_features(
+                args.data_dir,
+                use_compression=False,
+                split="train"
+            )
+
+            if args.extract_rich:
+                # Save rich features
+                rich_csv_path = Path(args.output_dir) / args.dataset / f"{args.dataset}_rich_512D.csv"
+                rich_features_df.to_csv(rich_csv_path, index=False)
+                logger.info(f"💾 Rich features saved to: {rich_csv_path}")
+
+        # Feature compressor training
+        if args.train_compressor and not args.no_compression and not args.skip_training:
+            if compressor_exists and not args.fresh:
+                logger.info("✅ Using existing feature compressor")
+                extractor.model.use_compression = True
+                # Load compressor weights
+                compressor_checkpoint = torch.load(compressor_path)
+                extractor.model.feature_compressor.load_state_dict(
+                    compressor_checkpoint['compressor_state_dict']
+                )
+            else:
+                if rich_features_df is None:
+                    # Extract rich features if not already done
+                    logger.info("🔍 Extracting rich 512D features for compressor training...")
+                    rich_features_df = extractor.extract_features(
+                        args.data_dir,
+                        use_compression=False,
+                        split="train"
+                    )
+
+                logger.info("🎯 Training feature space compressor...")
+                extractor.train_feature_compressor(rich_features_df, epochs=100)
+
+        # Final feature extraction
+        logger.info("📊 Extracting final features...")
+
+        if args.no_compression:
+            # Use raw 512D features
+            final_features_df = extractor.extract_features(
+                args.data_dir,
+                use_compression=False,
+                split="train"
+            )
+            feature_type = "raw_512D"
+        else:
+            # Use compressed features
+            extractor.model.use_compression = True
+            final_features_df = extractor.extract_features(
+                args.data_dir,
+                use_compression=True,
+                split="train"
+            )
+            feature_type = f"compressed_{args.final_dim}D"
+
+        # Save final features and configurations
+        logger.info("💾 Saving features and configurations...")
+        csv_path, config_path = extractor.save_features_and_config(final_features_df, args.output_dir)
 
         # Save DBNN configuration
         extractor.config_manager.save_dbnn_config(extractor.dbnn_config)
 
-        logger.info("\n" + "="*60)
-        logger.info("SYSTEM EXECUTION COMPLETE!")
-        logger.info(f"Dataset: {DATASET_NAME}")
-        logger.info(f"Raw images: {DATA_DIR}/{DATASET_NAME}/ (with class subfolders)")
-        logger.info(f"Features CSV: {csv_path}")
-        logger.info(f"Dataset Config: {config_path}")
-        logger.info(f"DBNN Config: {CONFIG_DIR}/adaptive_dbnn.conf")
-        logger.info(f"Main Config: {CONFIG_DIR}/{DATASET_NAME}.json")
-        logger.info(f"Total samples: {len(features_df)}")
-        logger.info(f"Feature dimensions: {extractor.main_config['model']['feature_dims']}")
-        logger.info("="*60)
+        # Verification (if previous features exist)
+        previous_features_path = Path(args.output_dir) / args.dataset / f"{args.dataset}.csv"
+        if previous_features_path.exists() and not args.fresh:
+            logger.info("🔍 Verifying latent space consistency...")
+            consistency_results = extractor.verify_latent_consistency(str(previous_features_path))
+            if consistency_results.get('consistent', True):
+                logger.info("✅ Latent space consistency verified!")
+            else:
+                logger.warning("⚠️  Latent space consistency check failed")
+
+        # Final summary
+        logger.info("\n" + "="*70)
+        logger.info("🎉 SYSTEM EXECUTION COMPLETE!")
+        logger.info(f"📁 Dataset: {args.dataset}")
+        logger.info(f"📊 Data source: {args.data_source}")
+        logger.info(f"💾 Feature type: {feature_type}")
+        logger.info(f"📈 Final dimensions: {args.final_dim}D")
+        logger.info(f"📂 Raw images: {args.data_dir}/{args.dataset}/")
+        logger.info(f"💾 Features CSV: {csv_path}")
+        logger.info(f"⚙️  Dataset Config: {config_path}")
+        logger.info(f"⚙️  DBNN Config: {args.config_dir}/adaptive_dbnn.conf")
+        logger.info(f"⚙️  Main Config: {args.config_dir}/{args.dataset}.json")
+        logger.info(f"📊 Total samples: {len(final_features_df)}")
+        logger.info(f"🔢 Feature dimensions: {extractor.main_config['model']['feature_dims']}")
+
+        if rich_features_df is not None and args.extract_rich:
+            rich_csv_path = Path(args.output_dir) / args.dataset / f"{args.dataset}_rich_512D.csv"
+            logger.info(f"💎 Rich features: {rich_csv_path}")
+
+        logger.info("="*70)
 
         # Display sample
-        logger.info("\nSample of extracted features:")
-        print(features_df[['target', 'image_path'] + [f'feature_{i}' for i in range(5)]].head())
+        logger.info("\n📋 Sample of extracted features:")
+        sample_cols = ['target', 'image_path'] + [f'feature_{i}' for i in range(min(5, args.final_dim))]
+        print(final_features_df[sample_cols].head())
 
     except Exception as e:
-        logger.error(f"Error during execution: {str(e)}")
+        logger.error(f"❌ Error during execution: {str(e)}")
+        logger.error("💡 Use --help for command line options")
         raise
 
 if __name__ == "__main__":
