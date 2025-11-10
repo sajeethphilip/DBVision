@@ -274,7 +274,6 @@ class ConfigManager:
             }
         }
 
-# Update GenericImageDataset to accept data_source
 class GenericImageDataset(Dataset):
     def __init__(self, root_dir: str, dataset_name: str, config: Dict, split: str = "train", data_source: str = "auto"):
         self.root_dir = Path(root_dir)
@@ -283,34 +282,97 @@ class GenericImageDataset(Dataset):
         self.split = split
         self.data_source = data_source
 
+        # Load data FIRST
+        self.image_paths, self.targets, self.class_names = self._load_data()
         # Setup transforms
         self.transform = self._create_transforms()
-
-        # Load data based on specified source
-        self.image_paths, self.targets, self.class_names = self._load_data()
 
         logger.info(f"Loaded {len(self.image_paths)} images for {dataset_name} ({split}) from {data_source} source")
 
     def _create_transforms(self) -> transforms.Compose:
-        """Create appropriate transforms based on configuration"""
+        """Create transforms that adapt to image channels and resize to optimal size"""
         dataset_cfg = self.config['dataset']
-        input_size = dataset_cfg['input_size']
         mean = dataset_cfg['mean']
         std = dataset_cfg['std']
 
+        # Get actual image to determine number of channels
+        if len(self.image_paths) > 0:
+            try:
+                sample_image = Image.open(self.image_paths[0])
+                num_channels = len(sample_image.getbands())
+                logger.info(f"Detected {num_channels} channel(s) for dataset {self.dataset_name}")
+            except Exception as e:
+                logger.warning(f"Could not detect channels from sample image: {e}")
+                num_channels = dataset_cfg['in_channels']
+        else:
+            num_channels = dataset_cfg['in_channels']
+            logger.info(f"Using default {num_channels} channel(s) for dataset {self.dataset_name}")
+
+        # Adjust normalization for grayscale if needed
+        if num_channels == 1:
+            # Grayscale images - use single channel normalization
+            if len(mean) == 3:  # If config has RGB values, use first one
+                mean = [mean[0]]
+                std = [std[0]]
+            elif len(mean) == 0 or mean == [0.485, 0.456, 0.406]:  # Default ImageNet values
+                mean = [0.5]  # Default for grayscale
+                std = [0.5]
+        elif num_channels == 3 and len(mean) == 1:
+            # RGB images but config has grayscale values - replicate
+            mean = [mean[0]] * 3
+            std = [std[0]] * 3
+
+        # Determine optimal resize size based on original dimensions
+        if len(self.image_paths) > 0:
+            try:
+                sample_image = Image.open(self.image_paths[0])
+                original_width, original_height = sample_image.size
+
+                # Choose optimal size:
+                # - Small images (<=64px): keep original or scale to 32x32
+                # - Medium images (65-256px): scale to 64x64
+                # - Large images (>256px): scale to 128x128 to prevent memory issues
+                if original_height <= 64 and original_width <= 64:
+                    target_size = (32, 32)  # Standardize small images
+                elif original_height <= 256 and original_width <= 256:
+                    target_size = (64, 64)  # Good balance for medium images
+                else:
+                    target_size = (128, 128)  # Prevent memory issues for large images
+
+                logger.info(f"Original size: {original_width}x{original_height} -> Resizing to: {target_size[0]}x{target_size[1]}")
+
+            except Exception as e:
+                logger.warning(f"Could not detect image size: {e}")
+                target_size = (64, 64)  # Default fallback
+        else:
+            target_size = (64, 64)  # Default
+
         transform_list = [
-            transforms.Resize(input_size),
+            transforms.Resize(target_size),  # 🔥 KEY CHANGE: Resize to optimal size
             transforms.ToTensor(),
-            transforms.Normalize(mean=mean, std=std)
         ]
+
+        # Only add normalization if we have appropriate mean/std values
+        if len(mean) == num_channels and len(std) == num_channels:
+            transform_list.append(transforms.Normalize(mean=mean, std=std))
+            logger.info(f"Using normalization: mean={mean}, std={std}")
+        else:
+            logger.warning(f"Skipping normalization - mean/std mismatch: "
+                          f"channels={num_channels}, mean_len={len(mean)}, std_len={len(std)}")
 
         # Add augmentation for training
         if self.split == "train":
+            # Insert augmentation before resizing (so we augment the original image)
             transform_list = [
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomRotation(10),
-                transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.1)
-            ] + transform_list
+                transforms.Resize(target_size),  # Resize after augmentation
+                transforms.ToTensor(),
+            ]
+
+            # Add normalization if applicable
+            if len(mean) == num_channels and len(std) == num_channels:
+                transform_list.append(transforms.Normalize(mean=mean, std=std))
 
         return transforms.Compose(transform_list)
 
@@ -473,23 +535,6 @@ class GenericImageDataset(Dataset):
                 raise
         else:
             raise ValueError(f"Unsupported dataset: {self.dataset_name}")
-
-    def initialize_model(self):
-        """Initialize the unified autoencoder model with dynamic sizing"""
-        num_classes = len(set(self.dataset.targets)) if self.dataset else 100
-
-        # Update config with actual image dimensions from dataset
-        if self.dataset and len(self.dataset) > 0:
-            sample_image, _, _ = self.dataset[0]
-            _, height, width = sample_image.shape
-            self.main_config['dataset']['input_size'] = [height, width]
-            logger.info(f"Detected image size: {height}x{width}")
-
-        self.model = UnifiedDiscriminativeAutoencoder(self.main_config, num_classes)
-        self.model = self.model.to(self.device)
-
-        logger.info(f"Initialized model with {sum(p.numel() for p in self.model.parameters()):,} parameters")
-        return self.model
 
     def __len__(self):
         return len(self.image_paths)
@@ -704,7 +749,7 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         # Use 512D for rich features, but we'll compress to config dimension for output
         self.latent_dim = 512  # Internal rich representation
         self.output_dim = model_cfg['feature_dims']  # Final output dimension (e.g., 32)
-        self.in_channels = dataset_cfg['in_channels']
+        self.in_channels = dataset_cfg['in_channels']  # This should be updated to actual channels
         self.input_size = dataset_cfg['input_size']
 
         # Enhancement modules
@@ -719,7 +764,7 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         self.semantic_expert = SemanticDensityExpert(self.latent_dim, num_classes)
         self.efficiency_critic = EfficiencyCritic(self.latent_dim)
 
-        # 🆕 FEATURE SPACE COMPRESSOR - trains after main autoencoder
+        # Feature Space Compressor - trains after main autoencoder
         self.feature_compressor = FeatureSpaceCompressor(
             input_dim=self.latent_dim,
             compressed_dim=self.output_dim,
@@ -732,22 +777,159 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
         # Domain-specific components
         self.setup_domain_specific_components()
 
+    def update_input_channels(self, actual_channels: int):
+        """Update the model to use the actual number of input channels"""
+        if actual_channels != self.in_channels:
+            logger.info(f"🔄 Updating model from {self.in_channels} to {actual_channels} input channels")
+            self.in_channels = actual_channels
+
+            # Rebuild encoder and decoder with correct channels
+            self.encoder = self._build_encoder()
+            self.decoder = self._build_decoder()
+
+            # Move to device
+            self.encoder = self.encoder.to(next(self.parameters()).device)
+            self.decoder = self.decoder.to(next(self.parameters()).device)
+
     def _build_encoder(self) -> nn.Module:
-        """Build encoder with larger 512D latent space for richer features"""
+        """Build encoder that works with standardized image sizes"""
         input_height, input_width = self.config['dataset']['input_size']
 
-        logger.info(f"Building enhanced encoder for {input_height}x{input_width} with 512D latent space")
+        logger.info(f"Building enhanced encoder for {input_height}x{input_width} with {self.in_channels} channels and 512D latent space")
 
-        if input_height <= 64:
-            return self._build_enhanced_small_encoder(input_height, input_width)
+        # All images are now standardized to 32x32, 64x64, or 128x128
+        # Use appropriate architecture for each size
+        if input_height <= 32:
+            return self._build_32x32_encoder()
+        elif input_height <= 64:
+            return self._build_64x64_encoder()
         else:
-            return self._build_enhanced_large_encoder(input_height, input_width)
+            return self._build_128x128_encoder()
+
+    def _build_32x32_encoder(self) -> nn.Module:
+        """Encoder for 32x32 images (like CIFAR, resized MNIST)"""
+        return nn.Sequential(
+            # Input: [channels, 32, 32]
+            nn.Conv2d(self.in_channels, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(64, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 16x16
+
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 8x8
+
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 4x4
+
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+
+            nn.Flatten(),
+            nn.Linear(512 * 2 * 2, 1024),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.LeakyReLU(0.1, True),
+            nn.Linear(512, 512)
+        )
+
+    def _build_64x64_encoder(self) -> nn.Module:
+        """Encoder for 64x64 images"""
+        return nn.Sequential(
+            # Input: [channels, 64, 64]
+            nn.Conv2d(self.in_channels, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 32x32
+
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 16x16
+
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 8x8
+
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 4x4
+
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+
+            nn.Flatten(),
+            nn.Linear(512 * 2 * 2, 1024),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.LeakyReLU(0.1, True),
+            nn.Linear(512, 512)
+        )
+
+    def _build_128x128_encoder(self) -> nn.Module:
+        """Encoder for 128x128 images (larger but memory-safe)"""
+        return nn.Sequential(
+            # Input: [channels, 128, 128]
+            nn.Conv2d(self.in_channels, 64, 3, 1, 1),
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 64x64
+
+            # Continue with 64x64 architecture
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 32x32
+
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 16x16
+
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),  # 8x8
+
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((2, 2)),  # 2x2
+
+            nn.Flatten(),
+            nn.Linear(512 * 2 * 2, 1024),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.LeakyReLU(0.1, True),
+            nn.Linear(512, 512)
+        )
 
     def _build_enhanced_small_encoder(self, input_height: int, input_width: int) -> nn.Module:
         """Enhanced encoder with 512D output for small images"""
         return nn.Sequential(
-            # Block 1: 64 channels
-            nn.Conv2d(self.in_channels, 64, 3, 1, 1),
+            # Block 1: 64 channels - UPDATED to use self.in_channels
+            nn.Conv2d(self.in_channels, 64, 3, 1, 1),  # Now uses actual input channels
             nn.BatchNorm2d(64),
             nn.LeakyReLU(0.1, True),
             nn.Conv2d(64, 64, 3, 1, 1),
@@ -790,75 +972,69 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.Linear(512 * 2 * 2, 1024),
             nn.LeakyReLU(0.1, True),
             nn.Dropout(0.3),
-            nn.Linear(1024, 512),  # Increased to 512D latent space
+            nn.Linear(1024, 512),
             nn.LeakyReLU(0.1, True),
-            nn.Linear(512, 512)    # Final 512D output
+            nn.Linear(512, 512)
         )
 
     def _build_enhanced_large_encoder(self, input_height: int, input_width: int) -> nn.Module:
-            """Enhanced encoder with 512D output for large images"""
-            return nn.Sequential(
-                # Initial downsampling for large images
-                nn.Conv2d(self.in_channels, 64, 7, 2, 3),  # /2
-                nn.BatchNorm2d(64),
-                nn.LeakyReLU(0.1, True),
-                nn.MaxPool2d(2, 2),  # /4 total
+        """Enhanced encoder with 512D output for large images"""
+        return nn.Sequential(
+            # Initial downsampling for large images - UPDATED to use self.in_channels
+            nn.Conv2d(self.in_channels, 64, 7, 2, 3),  # Now uses actual input channels
+            nn.BatchNorm2d(64),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),
 
-                # Block 1
-                nn.Conv2d(64, 128, 3, 1, 1),
-                nn.BatchNorm2d(128),
-                nn.LeakyReLU(0.1, True),
-                nn.Conv2d(128, 128, 3, 1, 1),
-                nn.BatchNorm2d(128),
-                nn.LeakyReLU(0.1, True),
-                nn.MaxPool2d(2, 2),  # /8
+            # Rest of the encoder remains the same...
+            nn.Conv2d(64, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(128, 128, 3, 1, 1),
+            nn.BatchNorm2d(128),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),
 
-                # Block 2
-                nn.Conv2d(128, 256, 3, 1, 1),
-                nn.BatchNorm2d(256),
-                nn.LeakyReLU(0.1, True),
-                nn.Conv2d(256, 256, 3, 1, 1),
-                nn.BatchNorm2d(256),
-                nn.LeakyReLU(0.1, True),
-                nn.MaxPool2d(2, 2),  # /16
+            nn.Conv2d(128, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(256, 256, 3, 1, 1),
+            nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.1, True),
+            nn.MaxPool2d(2, 2),
 
-                # Block 3
-                nn.Conv2d(256, 512, 3, 1, 1),
-                nn.BatchNorm2d(512),
-                nn.LeakyReLU(0.1, True),
-                nn.Conv2d(512, 512, 3, 1, 1),
-                nn.BatchNorm2d(512),
-                nn.LeakyReLU(0.1, True),
-                nn.AdaptiveAvgPool2d((4, 4)),
+            nn.Conv2d(256, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.Conv2d(512, 512, 3, 1, 1),
+            nn.BatchNorm2d(512),
+            nn.LeakyReLU(0.1, True),
+            nn.AdaptiveAvgPool2d((4, 4)),
 
-                nn.Flatten(),
-                nn.Linear(512 * 4 * 4, 1024),
-                nn.LeakyReLU(0.1, True),
-                nn.Dropout(0.3),
-                nn.Linear(1024, 512),  # 512D latent space
-                nn.LeakyReLU(0.1, True),
-                nn.Linear(512, 512)    # Final 512D output
-            )
+            nn.Flatten(),
+            nn.Linear(512 * 4 * 4, 1024),
+            nn.LeakyReLU(0.1, True),
+            nn.Dropout(0.3),
+            nn.Linear(1024, 512),
+            nn.LeakyReLU(0.1, True),
+            nn.Linear(512, 512)
+        )
 
     def _build_decoder(self) -> nn.Module:
-        """Build efficient decoder optimized for A100"""
-        if hasattr(self, 'dataset') and self.dataset and len(self.dataset) > 0:
-            sample_image, _, _ = self.dataset[0]
-            _, input_height, input_width = sample_image.shape
-        else:
-            input_height, input_width = self.config['dataset']['input_size']
+        """Build decoder for 512D latent space"""
+        input_height, input_width = self.config['dataset']['input_size']
 
-        logger.info(f"Building efficient decoder for {input_height}x{input_width}")
+        logger.info(f"Building decoder for {input_height}x{input_width} with {self.in_channels} output channels")
 
         if input_height <= 64:
-            return self._build_efficient_small_decoder(input_height, input_width)
+            return self._build_enhanced_small_decoder(input_height, input_width)
         else:
-            return self._build_efficient_large_decoder(input_height, input_width)
+            return self._build_enhanced_large_decoder(input_height, input_width)
 
-    def _build_efficient_small_decoder(self, input_height: int, input_width: int) -> nn.Module:
-        """Efficient decoder for small images"""
+    def _build_enhanced_small_decoder(self, input_height: int, input_width: int) -> nn.Module:
+        """Enhanced decoder for small images from 512D latent space"""
         return nn.Sequential(
-            nn.Linear(self.latent_dim, 512),
+            nn.Linear(512, 512),
             nn.LeakyReLU(0.1, True),
             nn.Linear(512, 512 * 2 * 2),
             nn.LeakyReLU(0.1, True),
@@ -887,8 +1063,8 @@ class UnifiedDiscriminativeAutoencoder(nn.Module):
             nn.BatchNorm2d(32),
             nn.LeakyReLU(0.1, True),
 
-            # Final convolution to get exact size
-            nn.Conv2d(32, self.in_channels, 3, 1, 1),
+            # Final convolution to get exact size - UPDATED to use self.in_channels
+            nn.Conv2d(32, self.in_channels, 3, 1, 1),  # Now uses actual output channels
             nn.Sigmoid()
         )
 
@@ -1177,9 +1353,21 @@ class UnifiedFeatureExtractor:
         return self.dataset
 
     def initialize_model(self):
-        """Initialize the unified autoencoder model"""
-        num_classes = len(set(self.dataset.targets)) if self.dataset else 100
+        """Initialize the unified autoencoder model with dynamic sizing"""
+        num_classes = len(set(self.dataset.targets)) if self.dataset else 10
 
+        # Update config with actual processed image dimensions
+        if self.dataset and len(self.dataset) > 0:
+            sample_image, _, _ = self.dataset[0]
+            channels, height, width = sample_image.shape
+
+            # These are the dimensions AFTER transforms (resizing)
+            self.main_config['dataset']['in_channels'] = channels
+            self.main_config['dataset']['input_size'] = [height, width]
+
+            logger.info(f"📊 Processed image dimensions: {channels} channels, {height}x{width}")
+
+        # Initialize model
         self.model = UnifiedDiscriminativeAutoencoder(self.main_config, num_classes)
         self.model = self.model.to(self.device)
 
@@ -1466,15 +1654,19 @@ class UnifiedFeatureExtractor:
         output_path = Path(output_dir) / self.dataset_name
         output_path.mkdir(parents=True, exist_ok=True)
 
-        # Save CSV
+        # Save CSV (keep all columns including image_path for reference)
         csv_path = output_path / f"{self.dataset_name}.csv"
         df.to_csv(csv_path, index=False)
         logger.info(f"Features saved to: {csv_path}")
 
-        # Create dataset configuration
+        # Get feature columns (exclude metadata columns)
+        metadata_columns = ['target', 'image_path', 'image_hash', 'extraction_timestamp', 'model_version', 'feature_type']
+        feature_columns = [col for col in df.columns if col not in metadata_columns]
+
+        # Create dataset configuration - ONLY target and features, no image_path
         dataset_config = {
             "file_path": f"data/{self.dataset_name}/{self.dataset_name}.csv",
-            "column_names": ["target", "image_path"] + [f"feature_{i}" for i in range(self.main_config['model']['feature_dims'])],
+            "column_names": ["target"] + feature_columns,  # Only target and features
             "separator": ",",
             "has_header": True,
             "target_column": "target",
@@ -1497,6 +1689,7 @@ class UnifiedFeatureExtractor:
             json.dump(dataset_config, f, indent=2)
 
         logger.info(f"Dataset configuration saved to: {dataset_config_path}")
+        logger.info(f"Configuration includes: target + {len(feature_columns)} features")
 
         return csv_path, dataset_config_path
 
